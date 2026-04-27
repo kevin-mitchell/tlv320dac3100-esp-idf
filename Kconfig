@@ -1,0 +1,7 @@
+menu "TLV320DAC3100 Driver"
+
+    config TLV320DAC3100_ENABLED
+        bool "Enable TLV320DAC3100 driver"
+        default y
+
+endmenu
