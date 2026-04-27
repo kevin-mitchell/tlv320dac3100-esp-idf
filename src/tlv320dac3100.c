@@ -21,9 +21,19 @@ struct tlv320_dev {
 /* -----------------------------------------------------------------------
  * Clock lookup table
  *
- * Entries satisfy: NDAC × MDAC × DOSR = mclk_hz / sample_rate
- * Constraint: 2.8 MHz < DOSR × sample_rate < 6.2 MHz
- * Filter A (highest quality) requires DOSR to be a multiple of 8.
+ * The chip cannot run at an audio sample rate directly — it needs a chain
+ * of integer dividers (NDAC, MDAC, DOSR) to step the incoming master clock
+ * (MCLK) down to the right speed.  Computing valid dividers at runtime
+ * requires a brute-force search, so instead we pre-calculate the values for
+ * the clock rates the ESP32 normally produces and store them here.
+ *
+ * Each row is: (MCLK frequency, sample rate) → divider values.
+ * The ESP32 I2S peripheral generates MCLK as a fixed multiple of the sample
+ * rate — typically 256× for 16-bit audio (e.g. 48 000 × 256 = 12 288 000 Hz).
+ *
+ * Math: NDAC × MDAC × DOSR must equal MCLK / sample_rate.
+ * Datasheet constraint: 2.8 MHz < DOSR × sample_rate < 6.2 MHz.
+ * DOSR must be a multiple of 8 to enable the highest-quality filter (Filter A).
  * --------------------------------------------------------------------- */
 
 typedef struct {
@@ -48,12 +58,14 @@ static const clk_entry_t s_clk_table[] = {
  * I2C helpers
  * --------------------------------------------------------------------- */
 
+/* Send one byte to a register: [reg_address, value] over I2C. */
 static esp_err_t write_reg(struct tlv320_dev *dev, uint8_t reg, uint8_t val)
 {
     uint8_t buf[2] = { reg, val };
     return i2c_master_transmit(dev->i2c_dev, buf, sizeof(buf), 50);
 }
 
+/* Read one byte back from a register (send address, then receive). */
 static esp_err_t read_reg(struct tlv320_dev *dev, uint8_t reg, uint8_t *val)
 {
     esp_err_t ret = i2c_master_transmit(dev->i2c_dev, &reg, 1, 50);
@@ -61,6 +73,9 @@ static esp_err_t read_reg(struct tlv320_dev *dev, uint8_t reg, uint8_t *val)
     return i2c_master_receive(dev->i2c_dev, val, 1, 50);
 }
 
+/* The chip's registers are split into pages (page 0 = digital, page 1 = analog).
+ * You select a page by writing its number to register 0x00.  We cache the current
+ * page and skip the I2C write when we're already on the right one. */
 static esp_err_t set_page(struct tlv320_dev *dev, uint8_t page)
 {
     if (dev->cur_page == page) return ESP_OK;
@@ -69,7 +84,8 @@ static esp_err_t set_page(struct tlv320_dev *dev, uint8_t page)
     return ret;
 }
 
-/* Shorthand helpers that switch page before writing. */
+/* Convenience macros: switch to page 0 (digital) or page 1 (analog), write a
+ * register, and return immediately if anything fails. */
 #define WR0(dev, reg, val)  do { \
     esp_err_t _r = set_page(dev, 0); \
     if (_r == ESP_OK) _r = write_reg(dev, reg, val); \
@@ -86,6 +102,7 @@ static esp_err_t set_page(struct tlv320_dev *dev, uint8_t page)
  * Clock configuration
  * --------------------------------------------------------------------- */
 
+/* Scan the table for a row matching the given MCLK and sample rate. */
 static const clk_entry_t *find_clk(uint32_t mclk_hz, uint32_t sample_rate)
 {
     for (size_t i = 0; i < sizeof(s_clk_table) / sizeof(s_clk_table[0]); i++) {
@@ -97,6 +114,9 @@ static const clk_entry_t *find_clk(uint32_t mclk_hz, uint32_t sample_rate)
     return NULL;
 }
 
+/* Write the chip's clock dividers (NDAC, MDAC, DOSR) so the DAC runs at the
+ * requested sample rate, and configure the I2S interface word length.
+ * Called once during init and again any time the stream format changes. */
 static esp_err_t apply_clk(struct tlv320_dev *dev, uint32_t sample_rate,
                            uint8_t bits)
 {
@@ -141,6 +161,8 @@ static esp_err_t apply_clk(struct tlv320_dev *dev, uint32_t sample_rate,
  * Output stage helpers (page 1)
  * --------------------------------------------------------------------- */
 
+/* Power the line-out / headphone driver for left and/or right channels.
+ * CM_1V65 sets the common-mode bias voltage to 1.65 V (mid-rail for 3.3 V). */
 static esp_err_t power_hp(struct tlv320_dev *dev, bool left, bool right)
 {
     uint8_t val = HP_BIT2_RESERVED | CM_1V65;
@@ -150,6 +172,7 @@ static esp_err_t power_hp(struct tlv320_dev *dev, bool left, bool right)
                                         : ESP_FAIL;
 }
 
+/* Enable or disable the Class-D speaker amplifier. */
 static esp_err_t power_spk(struct tlv320_dev *dev, bool en)
 {
     return (set_page(dev, 1) == ESP_OK)
@@ -193,10 +216,12 @@ esp_err_t tlv320_init(tlv320_handle_t *out_handle, const tlv320_config_t *cfg)
     if (ret != ESP_OK) goto fail;
 
     /* ── DAC data path ──────────────────────────────────────────────── */
-    /* PRB_P1: processing block 1 (standard for 48 kHz playback). */
+    /* Select the internal DSP processing block.  PRB_P1 is the standard
+     * stereo playback configuration — no EQ or effects, lowest latency. */
     WR0(dev, R_DAC_PRB, 0x01);
 
-    /* L+R DAC powered, normal data path, 1-sample soft-step.
+    /* Power both DAC channels, route left audio → left channel and right → right
+     * (no swap/mix), enable soft-step so volume changes ramp smoothly.
      * 0xD4 = 1101 0100: D7=1(L_pwr) D6=1(R_pwr) D5:D4=01(L_normal)
      *                    D3:D2=01(R_normal) D1:D0=00(softstep 1 samp) */
     WR0(dev, R_DAC_DATAPATH, 0xD4);
@@ -204,30 +229,34 @@ esp_err_t tlv320_init(tlv320_handle_t *out_handle, const tlv320_config_t *cfg)
     /* Unmute both channels, independent L/R control. */
     WR0(dev, R_DAC_VOL_CTRL, 0x00);
 
-    /* Digital volume: 0 dB on both channels. */
+    /* Digital volume: 0 dB on both channels (register value 0 = full scale). */
     WR0(dev, R_DAC_LVOL, 0x00);
     WR0(dev, R_DAC_RVOL, 0x00);
 
     /* ── Analog output routing (page 1) ─────────────────────────────── */
-    /* Route L-DAC to left mixer (D7:D6=01), R-DAC to right mixer (D3:D2=01).
-     * 0x44 = 0100 0100 */
+    /* Wire the digital DAC outputs to the analog output drivers.
+     * The chip has an internal mixer that sits between the DAC and the
+     * physical output pins; we route L-DAC → left mixer, R-DAC → right mixer.
+     * 0x44 = 0100 0100: D7:D6=01 (L→mixer), D3:D2=01 (R→mixer) */
     WR1(dev, R1_OUT_ROUTING, 0x44);
 
-    /* Analog volume controls: enable route (D7=1), 0 dB attenuation (D6:D0=0). */
+    /* Set analog volume for each output path to 0 dB (no attenuation).
+     * The D7 bit enables the route; D6:D0=0 means full level. */
     WR1(dev, R1_HPL_VOL, 0x80);
     WR1(dev, R1_HPR_VOL, 0x80);
     WR1(dev, R1_SPK_VOL, 0x80);
 
-    /* Output driver PGA: HPL/HPR at 0 dB gain, unmuted (D2=1 means output enabled).
+    /* Set the line-out driver gain to 0 dB and enable the output.
      * 0x04 = 0000 0100: D6:D3=0000 (0 dB), D2=1 (enabled) */
     WR1(dev, R1_HPL_DRIVER, 0x04);
     WR1(dev, R1_HPR_DRIVER, 0x04);
 
-    /* Speaker driver: 6 dB fixed gain (minimum, D4:D3=00), output enabled.
+    /* Set the Class-D speaker driver to minimum gain (6 dB) and enable it.
      * 0x04 = 0000 0100: D4:D3=00 (6 dB), D2=1 (enabled) */
     WR1(dev, R1_SPK_DRIVER, 0x04);
 
-    /* HP outputs in line-out mode (D2=1 left, D1=1 right). */
+    /* Put the HP pins into line-out mode rather than headphone mode.
+     * Line-out skips the pop-suppression circuitry and suits an external amp. */
     WR1(dev, R1_HP_DRIVER_CTRL, 0x06);
 
     /* Power up HP drivers: both channels, CM=1.65 V.
@@ -290,9 +319,9 @@ esp_err_t tlv320_set_volume(tlv320_handle_t handle, int vol_pct)
         return write_reg(dev, R_DAC_VOL_CTRL, 0x0C);
     }
 
-    /* Map 100% → 0 dB (reg 0x00), 1% → ~−63 dB (reg 0x81).
-     * The DAC volume register is signed 8-bit two's complement:
-     * positive = boost, negative = attenuation (steps of 0.5 dB). */
+    /* The volume register is a signed number where 0 = full volume (0 dB) and
+     * each step down is −0.5 dB, so −127 steps ≈ −63.5 dB (nearly silent).
+     * We map the 1–100% range linearly onto that: 100% → 0, 1% → −127. */
     int8_t reg_val = (int8_t)(-(int32_t)(100 - vol_pct) * 127 / 100);
 
     ret = write_reg(dev, R_DAC_LVOL, (uint8_t)reg_val);
@@ -312,7 +341,9 @@ esp_err_t tlv320_set_mute(tlv320_handle_t handle, bool mute)
     esp_err_t ret = set_page(dev, 0);
     if (ret != ESP_OK) return ret;
 
-    /* D3=L_mute, D2=R_mute; D1:D0=00 (independent mode). */
+    /* The chip waits for the audio waveform to cross zero before going silent,
+     * which prevents the click you'd otherwise hear from an abrupt cut.
+     * D3=L_mute, D2=R_mute; D1:D0=00 (independent mode). */
     return write_reg(dev, R_DAC_VOL_CTRL, mute ? 0x0C : 0x00);
 }
 

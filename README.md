@@ -3,6 +3,13 @@
 ESP-IDF component for the Texas Instruments TLV320DAC3100 stereo audio DAC.
 Pure C, no Arduino, no ESP-ADF dependency.
 
+## A note from a human
+
+Hi, this is Kevin, a real human. I'm writing this section of text, but I have NOT written much else in this repository. This was almost entirely generated using Claude (there is another disclosure about this below - but even this was written by Claude). That said, the general idea here was that I want to use this TLV320 DAC in a project using ESP-IDF and I wanted a library written in C that I could easily drop into a IDF project with minimal extra steps. The Adafruit library seemed like a simple place to start from, so I fed that along with various TLV320 documentation to Claude and this repository is the result of that. For these reasons, I wanted to call out these things:
+
+1. **Don't be fooled by convincing words from Claude e.g. documentation below, at this point this library is almost entirely untested** - _ASSUME_ it will not work (I'll update this readme once I've fully implemented it)
+2. More of #1, but comments in code are unchecked / unverified - as I go through a full implementation with this "library" I'll update the docs as I get a better understanding of the TLV320, for now this is just a starting point - I'll update this section of the docs to reflect my real world, human lived experience once I have more
+
 ---
 
 ## Origin and acknowledgements
