@@ -106,9 +106,13 @@ for any of the output signals above.
 
 ---
 
-## Quick start
+## Examples
 
-The minimal setup: initialize the codec and the I2S stream, then write audio samples.
+### Example 1: Minimal setup
+
+Shows the skeleton — I2C bus, codec, and I2S stream initialised, then a single write.
+This is the starting point; in a real project you replace the single write with a loop
+(see Example 2).
 
 ```c
 #include "driver/i2c_master.h"
@@ -173,8 +177,8 @@ void app_main(void)
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(i2s_tx, &i2s_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(i2s_tx));
 
-    // 5. If the stream sample rate or bit depth differs from the init default,
-    //    tell the codec.  Skip this if you're using 48 kHz / 16-bit.
+    // 5. If your stream's sample rate or bit depth differs from the default
+    //    (48 kHz / 16-bit), tell the codec here.  Otherwise this line is optional.
     tlv320_configure(codec, 48000, 16);
 
     // 6. Write audio.
@@ -186,6 +190,136 @@ void app_main(void)
     // ... fill buf with your audio data ...
     size_t written;
     i2s_channel_write(i2s_tx, buf, sizeof(buf), &written, portMAX_DELAY);
+}
+```
+
+---
+
+### Example 2: Continuous playback
+
+In a real project the audio write runs in its own FreeRTOS task in an infinite loop.
+Setup happens once; the task then runs forever, feeding audio to the chip as fast as
+it can accept it.  `i2s_channel_write` naturally throttles to the audio sample rate —
+it blocks internally until the I2S hardware is ready for more data, so there's no
+need for sleeps or timers.
+
+The example below plays a block of PCM data (e.g. a sound clip loaded from flash)
+on repeat.  Swap `audio_data` / `audio_data_len` for whatever source you have.
+
+```c
+#include "driver/i2c_master.h"
+#include "driver/i2s_std.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "tlv320dac3100.h"
+
+#define PIN_I2C_SDA   GPIO_NUM_8
+#define PIN_I2C_SCL   GPIO_NUM_9
+#define PIN_I2S_MCLK  GPIO_NUM_0
+#define PIN_I2S_BCLK  GPIO_NUM_5
+#define PIN_I2S_LRCK  GPIO_NUM_6
+#define PIN_I2S_DOUT  GPIO_NUM_7
+
+#define AUDIO_BUF_BYTES 2048   // how many bytes to hand to I2S per iteration
+
+// Your PCM audio data.  One way to get this: convert a WAV file to a raw C array
+// using a tool like `xxd -i audio.raw > audio_data.c`, then declare it here.
+extern const uint8_t audio_data[];
+extern const size_t  audio_data_len;
+
+// The audio task receives both handles so it can play audio and react to errors.
+typedef struct {
+    i2s_chan_handle_t i2s_tx;
+    tlv320_handle_t   codec;
+} audio_task_args_t;
+
+static void audio_task(void *arg)
+{
+    audio_task_args_t *a = (audio_task_args_t *)arg;
+    static const char *TAG = "audio_task";
+
+    while (true) {
+        // Walk through the audio data in chunks, looping back to the start.
+        const uint8_t *p   = audio_data;
+        size_t         rem = audio_data_len;
+
+        while (rem > 0) {
+            size_t chunk = (rem > AUDIO_BUF_BYTES) ? AUDIO_BUF_BYTES : rem;
+            size_t written = 0;
+
+            // i2s_channel_write blocks until the I2S hardware accepts the data —
+            // this is what keeps playback at the correct speed without any sleep.
+            esp_err_t err = i2s_channel_write(a->i2s_tx, p, chunk,
+                                              &written, pdMS_TO_TICKS(1000));
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "i2s_channel_write failed: %s", esp_err_to_name(err));
+                vTaskDelay(pdMS_TO_TICKS(100));  // brief pause before retrying
+                continue;
+            }
+
+            p   += written;
+            rem -= written;
+        }
+        // reached the end of the clip — loop back to the start automatically
+    }
+}
+
+void app_main(void)
+{
+    // ── I2C bus ──────────────────────────────────────────────────────────
+    i2c_master_bus_config_t i2c_cfg = {
+        .i2c_port          = I2C_NUM_0,
+        .sda_io_num        = PIN_I2C_SDA,
+        .scl_io_num        = PIN_I2C_SCL,
+        .clk_source        = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+    };
+    i2c_master_bus_handle_t i2c_bus;
+    ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_cfg, &i2c_bus));
+
+    // ── Codec ─────────────────────────────────────────────────────────────
+    tlv320_config_t codec_cfg = {
+        .i2c_bus  = i2c_bus,
+        .i2c_addr = TLV320_I2C_ADDR_DEFAULT,
+        .mclk_hz  = 0,
+    };
+    tlv320_handle_t codec;
+    ESP_ERROR_CHECK(tlv320_init(&codec, &codec_cfg));
+    tlv320_set_volume(codec, 75);
+
+    // ── I2S stream ────────────────────────────────────────────────────────
+    i2s_chan_handle_t i2s_tx;
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &i2s_tx, NULL));
+
+    i2s_std_config_t i2s_cfg = {
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(48000),
+        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                                     I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = PIN_I2S_MCLK,
+            .bclk = PIN_I2S_BCLK,
+            .ws   = PIN_I2S_LRCK,
+            .dout = PIN_I2S_DOUT,
+            .din  = I2S_GPIO_UNUSED,
+        },
+    };
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(i2s_tx, &i2s_cfg));
+    ESP_ERROR_CHECK(i2s_channel_enable(i2s_tx));
+    tlv320_configure(codec, 48000, 16);
+
+    // ── Start the audio task ──────────────────────────────────────────────
+    // A dedicated FreeRTOS task handles writing — it runs forever while
+    // app_main (and any other tasks you create) continue in parallel.
+    static audio_task_args_t task_args;   // static so it outlives app_main's stack
+    task_args.i2s_tx = i2s_tx;
+    task_args.codec  = codec;
+
+    xTaskCreate(audio_task, "audio", 4096, &task_args, 5, NULL);
+
+    // app_main can now do other work — button polling, Wi-Fi, display, etc.
+    // The audio task runs in the background continuously.
 }
 ```
 

@@ -62,15 +62,29 @@ static const clk_entry_t s_clk_table[] = {
 static esp_err_t write_reg(struct tlv320_dev *dev, uint8_t reg, uint8_t val)
 {
     uint8_t buf[2] = { reg, val };
-    return i2c_master_transmit(dev->i2c_dev, buf, sizeof(buf), 50);
+    esp_err_t ret = i2c_master_transmit(dev->i2c_dev, buf, sizeof(buf), 50);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "I2C write failed (reg=0x%02x val=0x%02x): %s",
+                 reg, val, esp_err_to_name(ret));
+    }
+    return ret;
 }
 
 /* Read one byte back from a register (send address, then receive). */
 static esp_err_t read_reg(struct tlv320_dev *dev, uint8_t reg, uint8_t *val)
 {
     esp_err_t ret = i2c_master_transmit(dev->i2c_dev, &reg, 1, 50);
-    if (ret != ESP_OK) return ret;
-    return i2c_master_receive(dev->i2c_dev, val, 1, 50);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "I2C read failed sending address for reg=0x%02x: %s",
+                 reg, esp_err_to_name(ret));
+        return ret;
+    }
+    ret = i2c_master_receive(dev->i2c_dev, val, 1, 50);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "I2C read failed receiving data for reg=0x%02x: %s",
+                 reg, esp_err_to_name(ret));
+    }
+    return ret;
 }
 
 /* The chip's registers are split into pages (page 0 = digital, page 1 = analog).
@@ -120,18 +134,28 @@ static const clk_entry_t *find_clk(uint32_t mclk_hz, uint32_t sample_rate)
 static esp_err_t apply_clk(struct tlv320_dev *dev, uint32_t sample_rate,
                            uint8_t bits)
 {
+    if (bits != 16 && bits != 24) {
+        ESP_LOGE(TAG, "unsupported bit depth %u — only 16 and 24 are supported", bits);
+        return ESP_ERR_INVALID_ARG;
+    }
+
     /* Determine MCLK: use configured value if set, else 256 × sample_rate. */
     uint32_t mclk = dev->cfg.mclk_hz ? dev->cfg.mclk_hz : sample_rate * 256;
 
     const clk_entry_t *e = find_clk(mclk, sample_rate);
     if (!e && dev->cfg.mclk_hz) {
-        /* Fixed MCLK didn't match; try auto-derived fallbacks. */
+        /* Configured mclk_hz had no exact match; try the standard ESP32 multiples
+         * in case the user's value was close but not exact. */
+        ESP_LOGW(TAG, "mclk_hz=%lu has no preset for fs=%lu Hz — trying 256x/512x fallbacks",
+                 (unsigned long)dev->cfg.mclk_hz, (unsigned long)sample_rate);
         e = find_clk(sample_rate * 256, sample_rate);
         if (!e) e = find_clk(sample_rate * 512, sample_rate);
     }
     if (!e) {
-        ESP_LOGE(TAG, "No clock preset for mclk=%lu fs=%lu",
-                 (unsigned long)mclk, (unsigned long)sample_rate);
+        ESP_LOGE(TAG, "no clock preset for fs=%lu Hz (tried mclk=%lu Hz). "
+                 "Supported sample rates: 32000, 44100, 48000 Hz. "
+                 "To add others, insert a row in s_clk_table in tlv320dac3100.c.",
+                 (unsigned long)sample_rate, (unsigned long)mclk);
         return ESP_ERR_NOT_SUPPORTED;
     }
 
@@ -168,16 +192,17 @@ static esp_err_t power_hp(struct tlv320_dev *dev, bool left, bool right)
     uint8_t val = HP_BIT2_RESERVED | CM_1V65;
     if (left)  val |= 0x80;
     if (right) val |= 0x40;
-    return (set_page(dev, 1) == ESP_OK) ? write_reg(dev, R1_HP_DRIVERS, val)
-                                        : ESP_FAIL;
+    esp_err_t ret = set_page(dev, 1);
+    if (ret != ESP_OK) return ret;
+    return write_reg(dev, R1_HP_DRIVERS, val);
 }
 
 /* Enable or disable the Class-D speaker amplifier. */
 static esp_err_t power_spk(struct tlv320_dev *dev, bool en)
 {
-    return (set_page(dev, 1) == ESP_OK)
-        ? write_reg(dev, R1_SPK_AMP, en ? 0x80 : 0x00)
-        : ESP_FAIL;
+    esp_err_t ret = set_page(dev, 1);
+    if (ret != ESP_OK) return ret;
+    return write_reg(dev, R1_SPK_AMP, en ? 0x80 : 0x00);
 }
 
 /* -----------------------------------------------------------------------
@@ -187,6 +212,17 @@ static esp_err_t power_spk(struct tlv320_dev *dev, bool en)
 esp_err_t tlv320_init(tlv320_handle_t *out_handle, const tlv320_config_t *cfg)
 {
     if (!out_handle || !cfg) return ESP_ERR_INVALID_ARG;
+
+    if (!cfg->i2c_bus) {
+        ESP_LOGE(TAG, "cfg->i2c_bus is NULL — create a bus with i2c_new_master_bus() first");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* The TLV320DAC3100 I2C address is set by the ADDR pin: 0x18 (low) or 0x19 (high). */
+    if (cfg->i2c_addr != 0x18 && cfg->i2c_addr != 0x19) {
+        ESP_LOGW(TAG, "unusual I2C address 0x%02x — expected 0x18 (ADDR pin low) "
+                 "or 0x19 (ADDR pin high)", cfg->i2c_addr);
+    }
 
     struct tlv320_dev *dev = calloc(1, sizeof(*dev));
     if (!dev) return ESP_ERR_NO_MEM;
@@ -201,7 +237,11 @@ esp_err_t tlv320_init(tlv320_handle_t *out_handle, const tlv320_config_t *cfg)
     };
     esp_err_t ret = i2c_master_bus_add_device(cfg->i2c_bus, &dev_cfg,
                                               &dev->i2c_dev);
-    if (ret != ESP_OK) { free(dev); return ret; }
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "failed to add TLV320 to I2C bus: %s", esp_err_to_name(ret));
+        free(dev);
+        return ret;
+    }
 
     /* ── Software reset ─────────────────────────────────────────────── */
     ret = set_page(dev, 0);
@@ -273,6 +313,11 @@ esp_err_t tlv320_init(tlv320_handle_t *out_handle, const tlv320_config_t *cfg)
     return ESP_OK;
 
 fail:
+    ESP_LOGE(TAG, "tlv320_init failed (%s) at I2C addr 0x%02x",
+             esp_err_to_name(ret), dev->cfg.i2c_addr);
+    if (ret == ESP_ERR_TIMEOUT) {
+        ESP_LOGE(TAG, "  → chip not responding: check wiring, 4.7kΩ pull-ups on SDA/SCL, and power supply");
+    }
     i2c_master_bus_rm_device(dev->i2c_dev);
     free(dev);
     return ret;
@@ -299,6 +344,10 @@ esp_err_t tlv320_configure(tlv320_handle_t handle, uint32_t sample_rate,
                            uint8_t bits)
 {
     if (!handle) return ESP_ERR_INVALID_ARG;
+    if (sample_rate == 0) {
+        ESP_LOGE(TAG, "sample_rate must not be 0");
+        return ESP_ERR_INVALID_ARG;
+    }
     return apply_clk(handle, sample_rate, bits);
 }
 
