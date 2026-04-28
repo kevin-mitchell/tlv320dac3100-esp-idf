@@ -1,8 +1,10 @@
 #include "tlv320dac3100.h"
 #include "tlv320dac3100_regs.h"
 #include "esp_log.h"
+#include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -16,6 +18,8 @@ struct tlv320_dev {
     i2c_master_dev_handle_t i2c_dev;
     tlv320_config_t         cfg;
     uint8_t                 cur_page;
+    SemaphoreHandle_t       lock;      /* serialises concurrent API calls */
+    uint8_t                 spk_att;   /* last SPK analog attenuation written (line-out mode) */
 };
 
 /* -----------------------------------------------------------------------
@@ -111,6 +115,72 @@ static esp_err_t set_page(struct tlv320_dev *dev, uint8_t page)
     if (_r == ESP_OK) _r = write_reg(dev, reg, val); \
     if (_r != ESP_OK) return _r; \
 } while(0)
+
+/* -----------------------------------------------------------------------
+ * Init helpers — DAC data path and analog routing
+ *
+ * Keeping these in their own functions means any WR0/WR1 failure returns
+ * from the helper (not from tlv320_init directly), so tlv320_init can
+ * catch the error and reach the fail: cleanup label properly.
+ * --------------------------------------------------------------------- */
+
+/* Configure the digital data path: power both DACs, normal L/R routing,
+ * 1-sample soft-step, 0 dB digital volume, both channels unmuted. */
+static esp_err_t init_datapath(struct tlv320_dev *dev)
+{
+    /* Select the internal DSP processing block.  PRB_P1 is the standard
+     * stereo playback configuration — no EQ or effects, lowest latency. */
+    WR0(dev, R_DAC_PRB, 0x01);
+
+    /* Power both DAC channels, route left audio → left channel and right → right
+     * (no swap/mix), enable soft-step so volume changes ramp smoothly.
+     * 0xD4 = 1101 0100: D7=1(L_pwr) D6=1(R_pwr) D5:D4=01(L_normal)
+     *                    D3:D2=01(R_normal) D1:D0=00(softstep 1 samp) */
+    WR0(dev, R_DAC_DATAPATH, 0xD4);
+
+    /* Unmute both channels, independent L/R control. */
+    WR0(dev, R_DAC_VOL_CTRL, 0x00);
+
+    /* Digital volume: 0 dB on both channels (register value 0 = full scale). */
+    WR0(dev, R_DAC_LVOL, 0x00);
+    WR0(dev, R_DAC_RVOL, 0x00);
+    return ESP_OK;
+}
+
+/* Configure the analog output routing: wire both DACs to the mixer, set
+ * 0 dB attenuation on all paths, enable and gain-stage all output drivers. */
+static esp_err_t init_routing(struct tlv320_dev *dev)
+{
+    /* Wire the digital DAC outputs to the analog output drivers.
+     * The chip has an internal mixer that sits between the DAC and the
+     * physical output pins; we route L-DAC → left mixer, R-DAC → right mixer.
+     * 0x44 = 0100 0100: D7:D6=01 (L→mixer), D3:D2=01 (R→mixer) */
+    WR1(dev, R1_OUT_ROUTING, 0x44);
+
+    /* Set analog volume for each output path to 0 dB (no attenuation).
+     * The D7 bit enables the route; D6:D0=0 means full level. */
+    WR1(dev, R1_HPL_VOL, 0x80);
+    WR1(dev, R1_HPR_VOL, 0x80);
+    WR1(dev, R1_SPK_VOL, 0x80);
+
+    /* Set the line-out driver gain to 0 dB and enable the output.
+     * 0x04 = 0000 0100: D6:D3=0000 (0 dB), D2=1 (enabled) */
+    WR1(dev, R1_HPL_DRIVER, 0x04);
+    WR1(dev, R1_HPR_DRIVER, 0x04);
+
+    /* Set the Class-D speaker driver to minimum gain (6 dB) and enable it.
+     * 0x04 = 0000 0100: D4:D3=00 (6 dB), D2=1 (enabled) */
+    WR1(dev, R1_SPK_DRIVER, 0x04);
+
+    /* HP driver mode: line-out bypasses the pop-suppression ramp (correct for
+     * an external amp); headphone mode enables it (correct for direct-drive). */
+    WR1(dev, R1_HP_DRIVER_CTRL, dev->cfg.hp_as_headphone ? 0x00 : 0x06);
+
+    /* Tie unused AIN1/AIN2 inputs to the chip's internal common-mode to prevent
+     * noise from floating inputs leaking into the output mixer. */
+    WR1(dev, R1_AIN_CM_CTRL, 0xC0);
+    return ESP_OK;
+}
 
 /* -----------------------------------------------------------------------
  * Clock configuration
@@ -243,6 +313,31 @@ esp_err_t tlv320_init(tlv320_handle_t *out_handle, const tlv320_config_t *cfg)
         return ret;
     }
 
+    dev->lock = xSemaphoreCreateMutex();
+    if (!dev->lock) {
+        ESP_LOGE(TAG, "failed to create mutex");
+        i2c_master_bus_rm_device(dev->i2c_dev);
+        free(dev);
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* ── Hardware reset (if GPIO wired) ────────────────────────────── */
+    if (cfg->reset_gpio >= 0) {
+        gpio_config_t gpio_cfg = {
+            .pin_bit_mask = (1ULL << cfg->reset_gpio),
+            .mode         = GPIO_MODE_OUTPUT,
+            .pull_up_en   = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type    = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&gpio_cfg);
+        gpio_set_level(cfg->reset_gpio, 0);   /* assert reset */
+        vTaskDelay(pdMS_TO_TICKS(1));          /* ≥ 10 ns required; 1 ms is safe */
+        gpio_set_level(cfg->reset_gpio, 1);   /* release reset */
+        vTaskDelay(pdMS_TO_TICKS(1));          /* chip needs ≤ 1 ms to initialise */
+        dev->cur_page = 0xFF;
+    }
+
     /* ── Software reset ─────────────────────────────────────────────── */
     ret = set_page(dev, 0);
     if (ret != ESP_OK) goto fail;
@@ -256,48 +351,12 @@ esp_err_t tlv320_init(tlv320_handle_t *out_handle, const tlv320_config_t *cfg)
     if (ret != ESP_OK) goto fail;
 
     /* ── DAC data path ──────────────────────────────────────────────── */
-    /* Select the internal DSP processing block.  PRB_P1 is the standard
-     * stereo playback configuration — no EQ or effects, lowest latency. */
-    WR0(dev, R_DAC_PRB, 0x01);
-
-    /* Power both DAC channels, route left audio → left channel and right → right
-     * (no swap/mix), enable soft-step so volume changes ramp smoothly.
-     * 0xD4 = 1101 0100: D7=1(L_pwr) D6=1(R_pwr) D5:D4=01(L_normal)
-     *                    D3:D2=01(R_normal) D1:D0=00(softstep 1 samp) */
-    WR0(dev, R_DAC_DATAPATH, 0xD4);
-
-    /* Unmute both channels, independent L/R control. */
-    WR0(dev, R_DAC_VOL_CTRL, 0x00);
-
-    /* Digital volume: 0 dB on both channels (register value 0 = full scale). */
-    WR0(dev, R_DAC_LVOL, 0x00);
-    WR0(dev, R_DAC_RVOL, 0x00);
+    ret = init_datapath(dev);
+    if (ret != ESP_OK) goto fail;
 
     /* ── Analog output routing (page 1) ─────────────────────────────── */
-    /* Wire the digital DAC outputs to the analog output drivers.
-     * The chip has an internal mixer that sits between the DAC and the
-     * physical output pins; we route L-DAC → left mixer, R-DAC → right mixer.
-     * 0x44 = 0100 0100: D7:D6=01 (L→mixer), D3:D2=01 (R→mixer) */
-    WR1(dev, R1_OUT_ROUTING, 0x44);
-
-    /* Set analog volume for each output path to 0 dB (no attenuation).
-     * The D7 bit enables the route; D6:D0=0 means full level. */
-    WR1(dev, R1_HPL_VOL, 0x80);
-    WR1(dev, R1_HPR_VOL, 0x80);
-    WR1(dev, R1_SPK_VOL, 0x80);
-
-    /* Set the line-out driver gain to 0 dB and enable the output.
-     * 0x04 = 0000 0100: D6:D3=0000 (0 dB), D2=1 (enabled) */
-    WR1(dev, R1_HPL_DRIVER, 0x04);
-    WR1(dev, R1_HPR_DRIVER, 0x04);
-
-    /* Set the Class-D speaker driver to minimum gain (6 dB) and enable it.
-     * 0x04 = 0000 0100: D4:D3=00 (6 dB), D2=1 (enabled) */
-    WR1(dev, R1_SPK_DRIVER, 0x04);
-
-    /* Put the HP pins into line-out mode rather than headphone mode.
-     * Line-out skips the pop-suppression circuitry and suits an external amp. */
-    WR1(dev, R1_HP_DRIVER_CTRL, 0x06);
+    ret = init_routing(dev);
+    if (ret != ESP_OK) goto fail;
 
     /* Power up HP drivers: both channels, CM=1.65 V.
      * 0xD4 = 1101 0100: D7=1(HPL) D6=1(HPR) D4:D3=10(CM_1V65) D2=1(reserved) */
@@ -318,6 +377,7 @@ fail:
     if (ret == ESP_ERR_TIMEOUT) {
         ESP_LOGE(TAG, "  → chip not responding: check wiring, 4.7kΩ pull-ups on SDA/SCL, and power supply");
     }
+    vSemaphoreDelete(dev->lock);
     i2c_master_bus_rm_device(dev->i2c_dev);
     free(dev);
     return ret;
@@ -328,12 +388,21 @@ esp_err_t tlv320_deinit(tlv320_handle_t handle)
     if (!handle) return ESP_ERR_INVALID_ARG;
     struct tlv320_dev *dev = handle;
 
+    /* Take the lock so we don't tear down while another task is mid-operation. */
+    if (xSemaphoreTake(dev->lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        ESP_LOGW(TAG, "deinit: could not acquire lock — forcing cleanup anyway");
+    }
+
     /* Mute and power down outputs before releasing resources. */
     set_page(dev, 0);
     write_reg(dev, R_DAC_VOL_CTRL, 0x0C); /* mute L+R */
     set_page(dev, 1);
     write_reg(dev, R1_HP_DRIVERS, HP_BIT2_RESERVED); /* HPL+HPR off */
     write_reg(dev, R1_SPK_AMP, 0x00);                /* speaker off */
+
+    /* Give then delete — must give before deleting or FreeRTOS asserts. */
+    xSemaphoreGive(dev->lock);
+    vSemaphoreDelete(dev->lock);
 
     i2c_master_bus_rm_device(dev->i2c_dev);
     free(dev);
@@ -348,7 +417,14 @@ esp_err_t tlv320_configure(tlv320_handle_t handle, uint32_t sample_rate,
         ESP_LOGE(TAG, "sample_rate must not be 0");
         return ESP_ERR_INVALID_ARG;
     }
-    return apply_clk(handle, sample_rate, bits);
+    struct tlv320_dev *dev = handle;
+    if (xSemaphoreTake(dev->lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        ESP_LOGE(TAG, "configure: timeout waiting for lock");
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t ret = apply_clk(dev, sample_rate, bits);
+    xSemaphoreGive(dev->lock);
+    return ret;
 }
 
 esp_err_t tlv320_set_volume(tlv320_handle_t handle, int vol_pct)
@@ -356,30 +432,81 @@ esp_err_t tlv320_set_volume(tlv320_handle_t handle, int vol_pct)
     if (!handle) return ESP_ERR_INVALID_ARG;
     struct tlv320_dev *dev = handle;
 
-    /* Clamp to valid range. */
     if (vol_pct < 0)   vol_pct = 0;
     if (vol_pct > 100) vol_pct = 100;
 
-    esp_err_t ret = set_page(dev, 0);
-    if (ret != ESP_OK) return ret;
-
-    if (vol_pct == 0) {
-        /* Hard mute via DAC mute bits. */
-        return write_reg(dev, R_DAC_VOL_CTRL, 0x0C);
+    if (xSemaphoreTake(dev->lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        ESP_LOGE(TAG, "set_volume: timeout waiting for lock");
+        return ESP_ERR_TIMEOUT;
     }
 
-    /* The volume register is a signed number where 0 = full volume (0 dB) and
-     * each step down is −0.5 dB, so −127 steps ≈ −63.5 dB (nearly silent).
-     * We map the 1–100% range linearly onto that: 100% → 0, 1% → −127. */
-    int8_t reg_val = (int8_t)(-(int32_t)(100 - vol_pct) * 127 / 100);
+    esp_err_t ret;
 
-    ret = write_reg(dev, R_DAC_LVOL, (uint8_t)reg_val);
-    if (ret != ESP_OK) return ret;
-    ret = write_reg(dev, R_DAC_RVOL, (uint8_t)reg_val);
-    if (ret != ESP_OK) return ret;
+    if (!dev->cfg.hp_as_headphone) {
+        /* ── Line-out mode ────────────────────────────────────────────────
+         * The line-out path (HPL/HPR → external amp) stays at 0 dB always
+         * so the amp receives a consistent reference level.  Volume is
+         * controlled by attenuating only the speaker (Class-D) analog path.
+         *
+         * vol_pct=0 uses the DAC mute bit, which silences both outputs —
+         * that is the correct behaviour for a mute gesture.
+         * vol_pct=1–100 maps linearly onto R1_SPK_VOL attenuation (0–127).
+         * ---------------------------------------------------------------- */
+        if (vol_pct == 0) {
+            ret = set_page(dev, 0);
+            if (ret != ESP_OK) goto done;
+            ret = write_reg(dev, R_DAC_VOL_CTRL, 0x0C); /* DAC mute */
+            goto done;
+        }
 
-    /* Clear mute bits (D3=0, D2=0), independent L/R mode. */
-    return write_reg(dev, R_DAC_VOL_CTRL, 0x00);
+        /* Unmute DAC (in case it was muted by a previous vol=0 call) and
+         * ensure the DAC digital volume is at full scale (0 dB) so the
+         * line-out gets the cleanest signal possible. */
+        ret = set_page(dev, 0);
+        if (ret != ESP_OK) goto done;
+        ret = write_reg(dev, R_DAC_VOL_CTRL, 0x00);
+        if (ret != ESP_OK) goto done;
+        ret = write_reg(dev, R_DAC_LVOL, 0x00);
+        if (ret != ESP_OK) goto done;
+        ret = write_reg(dev, R_DAC_RVOL, 0x00);
+        if (ret != ESP_OK) goto done;
+
+        /* Attenuate only the speaker analog path.  D7=1 keeps the routing
+         * to the Class-D amp enabled; D6:D0 is the attenuation (0=0 dB,
+         * 127=−78.3 dB). */
+        dev->spk_att = (uint8_t)((100 - vol_pct) * 127 / 100);
+        ret = set_page(dev, 1);
+        if (ret != ESP_OK) goto done;
+        ret = write_reg(dev, R1_SPK_VOL, 0x80 | dev->spk_att);
+
+    } else {
+        /* ── Headphone mode ───────────────────────────────────────────────
+         * Both the HP (headphone) and speaker outputs track the same
+         * volume, controlled by the DAC digital volume register which sits
+         * upstream of both paths.
+         *
+         * The register is signed: 0x00 = 0 dB (full), each step = −0.5 dB
+         * down to −63.5 dB (0x81).  1–100% maps linearly onto 0 → −63.5 dB.
+         * ---------------------------------------------------------------- */
+        ret = set_page(dev, 0);
+        if (ret != ESP_OK) goto done;
+
+        if (vol_pct == 0) {
+            ret = write_reg(dev, R_DAC_VOL_CTRL, 0x0C);
+            goto done;
+        }
+
+        int8_t dac_val = (int8_t)(-(int32_t)(100 - vol_pct) * 127 / 100);
+        ret = write_reg(dev, R_DAC_LVOL, (uint8_t)dac_val);
+        if (ret != ESP_OK) goto done;
+        ret = write_reg(dev, R_DAC_RVOL, (uint8_t)dac_val);
+        if (ret != ESP_OK) goto done;
+        ret = write_reg(dev, R_DAC_VOL_CTRL, 0x00);
+    }
+
+done:
+    xSemaphoreGive(dev->lock);
+    return ret;
 }
 
 esp_err_t tlv320_set_mute(tlv320_handle_t handle, bool mute)
@@ -387,13 +514,21 @@ esp_err_t tlv320_set_mute(tlv320_handle_t handle, bool mute)
     if (!handle) return ESP_ERR_INVALID_ARG;
     struct tlv320_dev *dev = handle;
 
-    esp_err_t ret = set_page(dev, 0);
-    if (ret != ESP_OK) return ret;
+    if (xSemaphoreTake(dev->lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        ESP_LOGE(TAG, "set_mute: timeout waiting for lock");
+        return ESP_ERR_TIMEOUT;
+    }
 
     /* The chip waits for the audio waveform to cross zero before going silent,
      * which prevents the click you'd otherwise hear from an abrupt cut.
      * D3=L_mute, D2=R_mute; D1:D0=00 (independent mode). */
-    return write_reg(dev, R_DAC_VOL_CTRL, mute ? 0x0C : 0x00);
+    esp_err_t ret = set_page(dev, 0);
+    if (ret == ESP_OK) {
+        ret = write_reg(dev, R_DAC_VOL_CTRL, mute ? 0x0C : 0x00);
+    }
+
+    xSemaphoreGive(dev->lock);
+    return ret;
 }
 
 esp_err_t tlv320_set_output(tlv320_handle_t handle, tlv320_output_t output)
@@ -404,7 +539,14 @@ esp_err_t tlv320_set_output(tlv320_handle_t handle, tlv320_output_t output)
     bool spk = (output & TLV320_OUTPUT_SPEAKER) != 0;
     bool lo  = (output & TLV320_OUTPUT_LINEOUT) != 0;
 
+    if (xSemaphoreTake(dev->lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        ESP_LOGE(TAG, "set_output: timeout waiting for lock");
+        return ESP_ERR_TIMEOUT;
+    }
+
     esp_err_t ret = power_hp(dev, lo, lo);
-    if (ret != ESP_OK) return ret;
-    return power_spk(dev, spk);
+    if (ret == ESP_OK) ret = power_spk(dev, spk);
+
+    xSemaphoreGive(dev->lock);
+    return ret;
 }

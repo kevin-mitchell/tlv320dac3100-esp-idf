@@ -40,6 +40,7 @@
 #define R1_HPR_DRIVER       0x29
 #define R1_SPK_DRIVER       0x2A  /* D4:D3=gain (00=6,01=12,10=18,11=24 dB), D2=1→unmuted */
 #define R1_HP_DRIVER_CTRL   0x2C  /* D2=HPL_lineout, D1=HPR_lineout */
+#define R1_AIN_CM_CTRL      0x32  /* D7=AIN1_to_CM, D6=AIN2_to_CM (tie unused inputs to CM) */
 
 /* ── CODEC_IF_CTRL1 field values ─────────────────────────────────────── */
 #define IF_FMT_I2S          0x00  /* bits 7:6 */

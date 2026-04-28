@@ -438,6 +438,85 @@ Supported sample rates: **32 000, 44 100, 48 000 Hz**.  Supported bit depths: **
 
 ---
 
+## Default configuration decisions
+
+`tlv320_init()` makes a set of opinionated register choices.  These are documented here
+so you know what to change if your use case differs.
+
+**Both outputs active by default**
+The speaker (Class-D) and the line-out (HP pins) are both powered up after init.
+Call `tlv320_set_output()` to enable only one if you need to.
+
+**HP driver mode is set by `hp_as_headphone` in `tlv320_config_t`**
+Set `hp_as_headphone = false` (the default) when HPL/HPR feed an external amplifier
+or 3.5 mm line-out jack.  Set it `true` when HPL/HPR drive headphones directly.  The
+only hardware difference is that headphone mode enables the chip's pop-suppression ramp
+on power-up/down to prevent the click you'd hear in headphones.
+
+**`tlv320_set_volume()` behaves differently in each mode**
+
+- *Line-out mode* (`hp_as_headphone = false`): volume controls the **speaker (Class-D)
+  only** via the SPK analog attenuation register.  The line-out path stays at 0 dB (full
+  scale) so the connected amplifier always receives a consistent reference level and uses
+  its own input trim/volume for level matching.  `vol_pct = 0` mutes both outputs via the
+  DAC mute bit — that is intentional for a mute gesture.
+
+- *Headphone mode* (`hp_as_headphone = true`): volume controls **both outputs** via the
+  DAC digital volume register (upstream of the HP/speaker split), so headphones and
+  speaker track together.
+
+**Line-out level at 0 dB**
+The datasheet specifies the HP output at full scale as **0.707 VRMS** (with CM = 1.65 V).
+Consumer line level is −10 dBV = 0.316 VRMS, so the chip's output is about 7 dB hotter
+than the consumer standard.  This is deliberate: running the DAC at full scale maximises
+SNR and the connected amplifier's input trim handles level matching, which is normal
+practice.  Explicitly attenuating to −10 dBV would sacrifice dynamic range for no
+practical benefit.
+
+**Common-mode voltage: 1.65 V** (mid-rail for a 3.3 V supply)
+This is the stable midpoint the output stages bias around.  Other options (1.35 V, 1.5 V,
+1.8 V) are possible but 1.65 V is the natural choice for a 3.3 V rail.
+
+**DSP processing block PRB_P1**
+The chip has 25 built-in processing blocks.  PRB_P1 is the simplest — stereo playback,
+no EQ, no effects, lowest power and shortest latency.  Other blocks enable biquad filters,
+DRC, or 3D effects; change `R_DAC_PRB` in `init_datapath()` if you need them.
+
+**Soft-step rate: 1 sample per step**
+Volume changes ramp at 0.125 dB per audio sample rather than jumping to the new level
+instantly, which prevents clicks.  The faster 1-sample rate is chosen (not 2-sample) so
+mute/unmute transitions are as short as possible.
+
+**Volume set to 0 dB (full scale) on init**
+`tlv320_init()` starts the DAC unmuted at 0 dB.  Call `tlv320_set_volume()` immediately
+after init to set your preferred level before audio starts flowing.
+
+**AIN1 / AIN2 tied to common mode** (P1/R50 = 0xC0)
+The chip has two analog bypass inputs that can mix a line-level signal directly into the
+output without going through the DAC.  Since most users won't use these, both inputs are
+connected internally to the chip's common-mode reference to stop floating inputs from
+injecting noise into the output.  To use AIN1 or AIN2, write 0x00 to P1/R50 to float
+them, then route them via the mixer registers (P1/R35).
+
+**MICBIAS powered down** (P1/R46 = 0x00, reset default)
+The chip has a microphone bias output for powering electret capsules.  The TLV320DAC3100
+is a DAC only — it has no ADC, so it cannot digitize a microphone signal itself.
+MICBIAS is left off.  If you need it to power a mic capsule for an external ADC, write
+the desired level to P1/R46 (2 V = 0x01, 2.5 V = 0x02, AVDD = 0x03).
+
+**VOL/MICDET pin: disabled** (P0/R116 D7 = 0, reset default)
+This pin can act as a hardware volume knob (wire a potentiometer between AVDD and GND)
+or detect headphone insertion.  Both functions are off by default.  Important: do not
+pull this pin to GND on the PCB — if the pin function is ever enabled, GND maps to
+SAR code 127 which means Mute.  Leave the pin floating if unused.
+
+**Class-D speaker gain: 6 dB** (minimum, P1/R0x2A D4:D3 = 00)
+The Class-D amplifier has a fixed analog gain stage; 6 dB is the minimum setting.
+Higher settings (12, 18, 24 dB) are available but 6 dB combined with the full digital
+volume range (0–100%) is enough headroom for most applications without clipping risk.
+
+---
+
 ## Further reading
 
 - [COMPATIBILITY.md](COMPATIBILITY.md) — how this library compares to the Adafruit Arduino library, feature by feature, and how to migrate from it.
