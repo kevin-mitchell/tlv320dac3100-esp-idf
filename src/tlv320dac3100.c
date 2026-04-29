@@ -536,17 +536,46 @@ esp_err_t tlv320_set_output(tlv320_handle_t handle, tlv320_output_t output)
     if (!handle) return ESP_ERR_INVALID_ARG;
     struct tlv320_dev *dev = handle;
 
-    bool spk = (output & TLV320_OUTPUT_SPEAKER) != 0;
-    bool lo  = (output & TLV320_OUTPUT_LINEOUT) != 0;
+    bool hp_on        = (output == TLV320_OUTPUT_LINEOUT          ||
+                         output == TLV320_OUTPUT_LINEOUT_SPEAKER              ||
+                         output == TLV320_OUTPUT_HEADPHONE         ||
+                         output == TLV320_OUTPUT_HEADPHONE_SPEAKER);
+    bool spk_on       = (output == TLV320_OUTPUT_SPEAKER           ||
+                         output == TLV320_OUTPUT_LINEOUT_SPEAKER              ||
+                         output == TLV320_OUTPUT_HEADPHONE_SPEAKER);
+    bool hp_headphone = (output == TLV320_OUTPUT_HEADPHONE         ||
+                         output == TLV320_OUTPUT_HEADPHONE_SPEAKER);
 
     if (xSemaphoreTake(dev->lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
         ESP_LOGE(TAG, "set_output: timeout waiting for lock");
         return ESP_ERR_TIMEOUT;
     }
 
-    esp_err_t ret = power_hp(dev, lo, lo);
-    if (ret == ESP_OK) ret = power_spk(dev, spk);
+    /* Update stored mode so subsequent set_volume() calls target the right
+     * register path (SPK analog vol for line-out modes, DAC digital vol for
+     * headphone modes). */
+    dev->cfg.hp_as_headphone = hp_headphone;
 
+    esp_err_t ret = set_page(dev, 1);
+    if (ret != ESP_OK) goto done;
+
+    /* Switch HP driver between line-out and headphone mode.  Line-out (0x06)
+     * bypasses pop-suppression; headphone (0x00) enables it. */
+    ret = write_reg(dev, R1_HP_DRIVER_CTRL, hp_headphone ? 0x00 : 0x06);
+    if (ret != ESP_OK) goto done;
+
+    ret = power_hp(dev, hp_on, hp_on);
+    if (ret != ESP_OK) goto done;
+    ret = power_spk(dev, spk_on);
+
+    ESP_LOGI(TAG, "output mode: %s",
+             output == TLV320_OUTPUT_SPEAKER           ? "speaker" :
+             output == TLV320_OUTPUT_LINEOUT           ? "line-out" :
+             output == TLV320_OUTPUT_LINEOUT_SPEAKER              ? "line-out+speaker" :
+             output == TLV320_OUTPUT_HEADPHONE         ? "headphone" :
+             output == TLV320_OUTPUT_HEADPHONE_SPEAKER ? "headphone+speaker" :
+                                                         "unknown");
+done:
     xSemaphoreGive(dev->lock);
     return ret;
 }

@@ -377,7 +377,7 @@ mute, or switch between the speaker and line-out.  Here's a simple polling examp
 
 static int  volume = 75;
 static bool muted  = false;
-static tlv320_output_t output_mode = TLV320_OUTPUT_BOTH;
+static tlv320_output_t output_mode = TLV320_OUTPUT_LINEOUT_SPEAKER;
 
 void buttons_init(void)
 {
@@ -410,9 +410,9 @@ void buttons_poll(tlv320_handle_t codec)
 
     if (!gpio_get_level(PIN_OUTPUT)) {
         // Cycle: BOTH → SPEAKER → LINEOUT → BOTH
-        if      (output_mode == TLV320_OUTPUT_BOTH)    output_mode = TLV320_OUTPUT_SPEAKER;
+        if      (output_mode == TLV320_OUTPUT_LINEOUT_SPEAKER)    output_mode = TLV320_OUTPUT_SPEAKER;
         else if (output_mode == TLV320_OUTPUT_SPEAKER) output_mode = TLV320_OUTPUT_LINEOUT;
-        else                                            output_mode = TLV320_OUTPUT_BOTH;
+        else                                            output_mode = TLV320_OUTPUT_LINEOUT_SPEAKER;
         tlv320_set_output(codec, output_mode);
     }
 }
@@ -420,6 +420,49 @@ void buttons_poll(tlv320_handle_t codec)
 
 Add debouncing (or use GPIO interrupts) in a real project — the example above is kept
 short to show the library calls clearly.
+
+---
+
+### Example 4: Switching output modes at runtime
+
+Call `tlv320_set_output()` to change which physical outputs are active and whether
+the HP pins behave as line-out or headphones.  Always follow it with `tlv320_set_volume()`
+so the new mode's volume registers are written correctly (line-out mode uses the speaker
+analog path; headphone mode uses the DAC digital path — they are different registers).
+
+```c
+#include "tlv320dac3100.h"
+
+/* The modes you want to cycle through — adjust for your hardware. */
+static const tlv320_output_t output_cycle[] = {
+    TLV320_OUTPUT_LINEOUT_SPEAKER,  /* both on, volume → speaker (default) */
+    TLV320_OUTPUT_SPEAKER,          /* speaker only                         */
+    TLV320_OUTPUT_HEADPHONE,        /* HP as headphone, volume → HP         */
+};
+#define OUTPUT_CYCLE_LEN  (sizeof(output_cycle) / sizeof(output_cycle[0]))
+
+static int s_output_idx = 0;  /* index into output_cycle, starts at default */
+static int s_vol_pct    = 75;
+
+/* Call this whenever the user triggers an output-mode switch
+ * (button combo, menu selection, jack detection interrupt, etc.). */
+void next_output_mode(tlv320_handle_t codec)
+{
+    s_output_idx = (s_output_idx + 1) % OUTPUT_CYCLE_LEN;
+    tlv320_set_output(codec, output_cycle[s_output_idx]);
+
+    /* Re-apply the current volume level.  The two modes use different
+     * hardware registers, so this write is always needed after a mode switch:
+     * line-out modes → SPK analog attenuation register (speaker path only)
+     * headphone modes → DAC digital volume register (upstream of both paths) */
+    tlv320_set_volume(codec, s_vol_pct);
+}
+```
+
+The `output_cycle` array is just a suggestion — include only the modes that make
+sense for your hardware.  If the HP jack always goes to a fixed external amplifier,
+`TLV320_OUTPUT_HEADPHONE` may never be needed.  If nothing is ever plugged into
+the HP jack, omit the lineout modes.
 
 ---
 
@@ -432,7 +475,7 @@ short to show the library calls clearly.
 | `tlv320_configure(handle, sample_rate, bits)` | Update the codec when the stream format changes (e.g. switching from 44.1 kHz to 48 kHz). |
 | `tlv320_set_volume(handle, 0–100)` | Set volume as a percentage. 0 = muted, 100 = full. |
 | `tlv320_set_mute(handle, bool)` | Mute or unmute without changing the stored volume level. |
-| `tlv320_set_output(handle, output)` | Choose which outputs are active: `TLV320_OUTPUT_SPEAKER`, `TLV320_OUTPUT_LINEOUT`, or `TLV320_OUTPUT_BOTH`. |
+| `tlv320_set_output(handle, output)` | Switch output mode at runtime. See `tlv320_output_t` for the five modes and how each affects volume control. Call `tlv320_set_volume()` afterwards to re-apply the current level to the new mode's registers. |
 
 Supported sample rates: **32 000, 44 100, 48 000 Hz**.  Supported bit depths: **16 and 24**.
 
@@ -443,15 +486,27 @@ Supported sample rates: **32 000, 44 100, 48 000 Hz**.  Supported bit depths: **
 `tlv320_init()` makes a set of opinionated register choices.  These are documented here
 so you know what to change if your use case differs.
 
-**Both outputs active by default**
-The speaker (Class-D) and the line-out (HP pins) are both powered up after init.
-Call `tlv320_set_output()` to enable only one if you need to.
+**Default output mode: `TLV320_OUTPUT_LINEOUT_SPEAKER` (line-out + speaker)**
+Both the Class-D speaker and the HP pins (in line-out mode) are powered on after init.
+Call `tlv320_set_output()` at any time to switch between the five modes:
 
-**HP driver mode is set by `hp_as_headphone` in `tlv320_config_t`**
-Set `hp_as_headphone = false` (the default) when HPL/HPR feed an external amplifier
-or 3.5 mm line-out jack.  Set it `true` when HPL/HPR drive headphones directly.  The
-only hardware difference is that headphone mode enables the chip's pop-suppression ramp
-on power-up/down to prevent the click you'd hear in headphones.
+| Mode | HP pins | Speaker | Volume controls |
+|------|---------|---------|----------------|
+| `TLV320_OUTPUT_SPEAKER` | off | on | speaker |
+| `TLV320_OUTPUT_LINEOUT` | line-out | off | nothing audible |
+| `TLV320_OUTPUT_LINEOUT_SPEAKER` | line-out | on | speaker only |
+| `TLV320_OUTPUT_HEADPHONE` | headphone | off | HP |
+| `TLV320_OUTPUT_HEADPHONE_SPEAKER` | headphone | on | both together |
+
+The initial mode is derived from `hp_as_headphone` in `tlv320_config_t`:
+`false` (default) → `TLV320_OUTPUT_LINEOUT_SPEAKER`; `true` → `TLV320_OUTPUT_HEADPHONE_SPEAKER`.
+After calling `tlv320_set_output()`, call `tlv320_set_volume()` to re-apply the
+current volume level to the registers for the new mode.
+
+**Headphone vs line-out: what actually differs in hardware**
+Line-out mode bypasses the pop-suppression ramp on the HP driver — correct for an
+external amp that handles its own muting.  Headphone mode enables the ramp, which
+prevents the click you'd hear when audio starts/stops with headphones in the jack.
 
 **`tlv320_set_volume()` behaves differently in each mode**
 

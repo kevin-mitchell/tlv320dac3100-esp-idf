@@ -64,10 +64,43 @@ typedef struct {
     bool     hp_as_headphone;
 } tlv320_config_t;
 
+/**
+ * @brief Output mode passed to tlv320_set_output().
+ *
+ * The mode controls two orthogonal things at once:
+ *   1. Which physical outputs are powered on (speaker / HP pins / both).
+ *   2. Whether the HP pins are driven as a line-out or as headphones —
+ *      this also determines what tlv320_set_volume() controls:
+ *
+ *   Line-out modes (SPEAKER, LINEOUT, BOTH):
+ *     tlv320_set_volume() attenuates the speaker analog path only.
+ *     The HP pins carry the full-scale DAC signal regardless of volume,
+ *     so a connected amplifier always gets a consistent reference level.
+ *
+ *   Headphone modes (HEADPHONE, HEADPHONE_SPEAKER):
+ *     tlv320_set_volume() attenuates the DAC digital output, which is
+ *     upstream of both the HP and speaker paths — both track together.
+ *     The HP driver also enables its pop-suppression ramp, which prevents
+ *     clicks when audio starts/stops with headphones in the jack.
+ *
+ * Default after tlv320_init() is TLV320_OUTPUT_LINEOUT_SPEAKER (line-out + speaker).
+ * Call tlv320_set_volume() after tlv320_set_output() so the volume
+ * registers are written to the correct path for the new mode.
+ */
 typedef enum {
-    TLV320_OUTPUT_SPEAKER = (1 << 0),
-    TLV320_OUTPUT_LINEOUT = (1 << 1),
-    TLV320_OUTPUT_BOTH    = (1 << 0) | (1 << 1),
+    TLV320_OUTPUT_SPEAKER           = 0, /**< Class-D speaker only; HP off.
+                                              Volume → speaker. */
+    TLV320_OUTPUT_LINEOUT           = 1, /**< HP as line-out only; speaker off.
+                                              Volume has no audible effect
+                                              (speaker is off; line-out is
+                                              fixed at full scale). */
+    TLV320_OUTPUT_LINEOUT_SPEAKER   = 2, /**< HP as line-out + speaker (default).
+                                              Volume → speaker only; line-out
+                                              stays at full scale for an amp. */
+    TLV320_OUTPUT_HEADPHONE         = 3, /**< HP as headphone only; speaker off.
+                                              Volume → HP. */
+    TLV320_OUTPUT_HEADPHONE_SPEAKER = 4, /**< HP as headphone + speaker.
+                                              Volume → both together. */
 } tlv320_output_t;
 
 /**
@@ -115,9 +148,14 @@ esp_err_t tlv320_set_volume(tlv320_handle_t handle, int vol_pct);
 esp_err_t tlv320_set_mute(tlv320_handle_t handle, bool mute);
 
 /**
- * @brief  Enable or disable individual output stages.
+ * @brief  Switch the active output mode at runtime.
  *
- * TLV320_OUTPUT_BOTH is the default after tlv320_init().
+ * Updates which physical outputs are powered and whether the HP pins are
+ * configured as line-out or headphone.  See tlv320_output_t for the full
+ * description of how each mode affects tlv320_set_volume().
+ *
+ * Call tlv320_set_volume() after this function to re-apply the current
+ * volume level to the correct registers for the new mode.
  */
 esp_err_t tlv320_set_output(tlv320_handle_t handle, tlv320_output_t output);
 
